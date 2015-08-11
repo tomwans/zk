@@ -88,6 +88,7 @@ func init() {
 		cmdSet,
 		cmdDelete,
 		cmdChildren,
+		cmdCp,
 		cmdHelp,
 	}
 }

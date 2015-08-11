@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"github.com/samuel/go-zookeeper/zk"
 	"os"
 	"sort"
@@ -278,22 +279,28 @@ Example:
 	Run: runChildren,
 }
 
-func showChildrenRecursively(conn *zk.Conn, path string) {
+func walkChildrenRecursively(conn *zk.Conn, path string, walkfunc func(string)) error {
 	children, _, err := conn.Children(path)
 	if err != nil {
-		return
+		return err
 	}
 
 	sort.Strings(children)
 	for _, child := range children {
 		if path == "/" {
-			outString("%s\n", path+child)
-			showChildrenRecursively(conn, path+child)
-		} else {
-			outString("%s\n", path+"/"+child)
-			showChildrenRecursively(conn, path+"/"+child)
+			walkfunc(path + child)
+			err = walkChildrenRecursively(conn, path+child, walkfunc)
 		}
+		walkfunc(path + "/" + child)
+		err = walkChildrenRecursively(conn, path+"/"+child, walkfunc)
 	}
+	return err
+}
+
+func showChildrenRecursively(conn *zk.Conn, path string) {
+	walkChildrenRecursively(conn, path, func(childpath string) {
+		outString("%s\n", childpath)
+	})
 }
 
 func runChildren(cmd *Command, args []string) {
@@ -324,6 +331,120 @@ func runChildren(cmd *Command, args []string) {
 		evt := <-events
 		must(evt.Err)
 	}
+}
+
+var cmdCp = &Command{
+	Usage: "cp <path> dst.example.com:2181/dstpath",
+	Short: "copies nodes to another ZooKeeper cluster",
+	Long: `
+cp copies nodes, recursively, from one path to another ZooKeeper cluster.
+
+Example:
+
+    $ zk cp /people dst.example.com:2181/
+`,
+	Run: runCp,
+}
+
+// parsehostpath will return the host and path as separate strings.
+// 'path' will always contain a leading /.
+func parsehostpath(hostpath string) (host string, path string) {
+	splits := strings.Split(hostpath, "/")
+	host = splits[0]
+	path = strings.Join(splits[1:len(splits)], "/")
+	path = "/" + path
+	return
+}
+
+func runCp(cmd *Command, args []string) {
+	if !(len(args) == 2) {
+		failUsage(cmd)
+	}
+
+	// we expect srcpath and dstpath to be something.
+	// they should always start with /.
+
+	srcPath := args[0]
+	dstHost, dstPath := parsehostpath(args[1])
+	if dstPath == "" {
+		dstPath = "/"
+	}
+
+	srcConn := connect()
+	defer srcConn.Close()
+
+	dstConn, _, err := zk.Connect([]string{dstHost}, time.Second)
+	must(err)
+	defer dstConn.Close()
+
+	err = walkChildrenRecursively(srcConn, srcPath, func(childpath string) {
+		// take srcPath, /x and dstpath, /y and merge them.
+		fullDestPath := strings.Join([]string{dstPath, childpath}, "")
+		if dstPath == "/" {
+			fullDestPath = srcPath
+		}
+		outString(childpath + " -> " + dstHost + fullDestPath + "\n")
+
+		// read the data from src.
+		data, _, err := srcConn.Get(childpath)
+
+		if err != nil {
+			outString(fmt.Sprintf("ERROR: reading data from src (%s): %s / %s\n", childpath, err, data))
+		}
+
+		acls, _, err := srcConn.GetACL(childpath)
+		if err != nil {
+			outString(fmt.Sprintf("ERROR: reading ACL from src (%s): %s / %v\n", childpath, err, acls))
+		}
+
+		// do the copy (or set)
+		err = createOrSet(dstConn, fullDestPath, data, int32(0), acls)
+		if err != nil {
+			outString(fmt.Sprintf("ERROR: copying node (%s): %s\n", childpath, err))
+		}
+		must(err)
+	})
+	must(err)
+}
+
+func createOrSet(zkConn *zk.Conn, path string, data []byte, flags int32, acl []zk.ACL) error {
+	exists, _, err := zkConn.Exists(path)
+	if err != nil {
+		return err
+	}
+
+	if exists {
+		_, err = zkConn.Set(path, data, -1)
+	} else {
+		err = createRecursively(zkConn, path, data, flags, acl)
+	}
+
+	return err
+}
+
+func createRecursively(zkConn *zk.Conn, path string, data []byte, flags int32, acl []zk.ACL) error {
+	pieces := strings.Split(path, "/")
+	acc := ""
+	for _, piece := range pieces {
+		fullpath := acc + "/" + piece
+
+		// skip trying to create the root node.
+		if fullpath == "/" {
+			continue
+		}
+
+		// just try to create it
+		_, err := zkConn.Create(fullpath, data, flags, acl)
+
+		// if its *NOT* an existing node, then return the err.
+		if err != nil && err != zk.ErrNodeExists {
+			return err
+		}
+
+		// continue on.
+		acc = acc + "/" + piece
+	}
+	return nil
 }
 
 func init() {
